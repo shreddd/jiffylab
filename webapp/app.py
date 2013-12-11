@@ -25,6 +25,7 @@ app.config['SECRET_KEY'] = 'devkey'
 
 CONTAINER_STORAGE = "/usr/local/etc/jiffylab/webapp/containers.json"
 SERVICES_HOST = '127.0.0.1'
+SERVICE_PORTS = (4200, 8888)
 BASE_IMAGE = 'ptone/jiffylab-base'
 
 initial_memory_budget = psutil.virtual_memory().free  # or can use available for vm
@@ -41,7 +42,7 @@ Bootstrap(app)
 
 docker_client = docker.Client(
         base_url='unix://var/run/docker.sock',
-        version="1.3"
+        version="1.6"
         )
 
 lock = threading.Lock()
@@ -147,41 +148,30 @@ def forget_container(name):
         return True
 
 def add_portmap(cont):
-    if cont['Ports']:
-        # a bit of a crazy comprehension to turn:
-        # Ports': u'49166->8888, 49167->22'
-        # into a useful dict {8888: 49166, 22: 49167}
-        cont['portmap'] = {int(k): int(v) for v, k in
-                [pair.split('->') for
-                    pair in cont['Ports'].split(',')]}
+    container_ports = cont['Ports']
+    if not container_ports:
+        raise Exception("No available ports on container.")
+    
+    cont['portmap'] = {
+        p['PrivatePort']: p['PublicPort'] for p in container_ports
+        if p['Type'] == 'tcp'
+    }
+    
+    # this should be done via ajax in the browser
+    # this will loop and kill the server if it stalls on docker
+    ports = set(SERVICE_PORTS)
+    while len(ports):
+        port = ports.pop()
+        try:
+            requests.head("http://{}:{}".format(
+                    app.config['SERVICES_HOST'],
+                    cont['portmap'][port]))
+        except requests.exceptions.ConnectionError:
+            ports.add(port)
 
-        # wait until services are up before returning container
-        # TODO this could probably be factored better when next
-        # service added
-        # this should be done via ajax in the browser
-        # this will loop and kill the server if it stalls on docker
-        ipy_wait = shellinabox_wait = True
-        while ipy_wait or shellinabox_wait:
-            if ipy_wait:
-                try:
-                    requests.head("http://{}:{}".format(
-                            app.config['SERVICES_HOST'],
-                            cont['portmap'][8888]))
-                    ipy_wait = False
-                except requests.exceptions.ConnectionError:
-                    pass
-
-            if shellinabox_wait:
-                try:
-                    requests.head("http://{}:{}".format(
-                            app.config['SERVICES_HOST'],
-                            cont['portmap'][4200]))
-                    shellinabox_wait = False
-                except requests.exceptions.ConnectionError:
-                    pass
-            time.sleep(.2)
-            print 'waiting', app.config['SERVICES_HOST']
-        return cont
+        time.sleep(.2)
+        print 'waiting', app.config['SERVICES_HOST']
+    return cont
 
 
 def get_container(cont_id, all=False):
@@ -220,7 +210,9 @@ def get_or_make_container(email):
     if "Up" not in container['Status']:
         # if the container is not currently running, restart it
         check_memory()
-        docker_client.start(container_id)
+        docker_client.start(container_id, port_bindings={
+            port: ('0.0.0.0',) for port in SERVICE_PORTS
+        })
         # refresh status
         container = get_container(container_id)
     container = add_portmap(container)
